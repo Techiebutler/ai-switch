@@ -1,5 +1,7 @@
 # ai-switch
 
+[![CI](https://github.com/Techiebutler/ai-switch/actions/workflows/ci.yml/badge.svg)](https://github.com/Techiebutler/ai-switch/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Switch between multiple accounts in your AI coding tools with one command, without signing in again.
 
 Supports **Claude Code**, **Codex CLI** and **Cursor**.
@@ -151,6 +153,10 @@ shellcheck install.sh tests/test.sh
 ```
 
 The tests use the file backend (`AI_SWITCH_BACKEND=file`), so they never touch your real Keychain or logins. Adding a tool means one class in `ai-switch` with `identity`, `export` and `apply` methods.
+
+## Contributing
+
+Contributions are welcome, especially support for more tools (Windsurf / Devin is the most wanted). Read [CONTRIBUTING.md](CONTRIBUTING.md) to get started, and please follow the [Code of Conduct](CODE_OF_CONDUCT.md). Found a security problem? See [SECURITY.md](SECURITY.md) and report it privately. Changes are listed in the [CHANGELOG](CHANGELOG.md).
 
 ## Disclaimer
 

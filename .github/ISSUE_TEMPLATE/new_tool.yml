@@ -1,0 +1,25 @@
+name: Support a new tool
+description: Ask for (or offer to add) support for another AI coding tool
+labels: [new-tool]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe **where** the tool stores its login, never the login itself. No tokens or file contents, only paths, key names and formats.
+  - type: input
+    id: tool
+    attributes:
+      label: Tool name and version
+      placeholder: "Windsurf 1.12"
+    validations:
+      required: true
+  - type: textarea
+    id: storage
+    attributes:
+      label: Where does it keep the login?
+      description: File paths, database keys, Keychain item names, and whether the data is encrypted. Write "unknown" if you don't know.
+  - type: dropdown
+    id: help
+    attributes:
+      label: Would you like to open the PR?
+      options: ["Yes", "Maybe, with guidance", "No"]

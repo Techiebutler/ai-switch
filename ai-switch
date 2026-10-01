@@ -579,7 +579,8 @@ def main(argv):
     if os.path.basename(sys.argv[0]) == "claude-switch":
         PROG = "claude-switch"
         argv = ["claude"] + argv
-    migrate_legacy()
+    if not set(argv) & {"-h", "--help", "help", "-v", "--version", "version"}:
+        migrate_legacy()
     if not argv:
         return list_all()
     head, rest = argv[0], argv[1:]

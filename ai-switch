@@ -1,0 +1,613 @@
+#!/usr/bin/env python3
+"""ai-switch: save several logins for AI coding tools and swap between them
+without signing in again.
+
+Each tool keeps its login somewhere different. A profile is a saved copy of
+that login: the secret part goes to the macOS Keychain (or a 0600 file on
+Linux) and the account identity goes to ~/.ai-switch/<tool>/<name>/account.json.
+Switching writes the saved copy back where the tool reads it.
+"""
+import base64
+import getpass
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+
+VERSION = "2.0.0"
+HOME = os.path.expanduser("~")
+IS_MAC = platform.system() == "Darwin"
+STORE = os.environ.get("AI_SWITCH_HOME") or os.path.join(HOME, ".ai-switch")
+LEGACY_STORE = os.environ.get("CLAUDE_SWITCH_HOME") or os.path.join(HOME, ".claude-switch")
+# keychain on macOS, plain 0600 files elsewhere (override for testing)
+BACKEND = (os.environ.get("AI_SWITCH_BACKEND") or os.environ.get("CLAUDE_SWITCH_BACKEND")
+           or ("keychain" if IS_MAC else "file"))
+PROG = "ai-switch"
+
+
+class Fail(Exception):
+    pass
+
+
+def info(msg):
+    print(msg, file=sys.stderr)
+
+
+# ---------- storage helpers ----------
+
+def read_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+
+
+def write_file(path, text, mode=0o600):
+    """Atomic write; keeps the mode of an existing file."""
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    if os.path.exists(path):
+        mode = os.stat(path).st_mode & 0o777
+    fd, tmp = tempfile.mkstemp(dir=d)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def write_json(path, data, mode=0o600, compact=False):
+    text = json.dumps(data, separators=(",", ":")) if compact else json.dumps(data, indent=2)
+    write_file(path, text, mode)
+
+
+def kc_account(service):
+    # reuse the account attribute of an existing item so we overwrite it in place
+    r = subprocess.run(["security", "find-generic-password", "-s", service],
+                       capture_output=True, text=True)
+    m = re.search(r'"acct"<blob>="(.*)"', r.stdout)
+    return m.group(1) if m else getpass.getuser()
+
+
+def kc_read(service):
+    r = subprocess.run(["security", "find-generic-password", "-s", service, "-w"],
+                       capture_output=True, text=True)
+    return r.stdout.rstrip("\n") if r.returncode == 0 else None
+
+
+def kc_write(service, secret):
+    # The secret is briefly visible to local `ps` while this runs. security(1)
+    # truncates secrets passed on stdin, so an argument is the only reliable way.
+    r = subprocess.run(["security", "add-generic-password", "-U", "-s", service,
+                        "-a", kc_account(service), "-w", secret],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise Fail(f"could not write keychain item '{service}': {r.stderr.strip()}")
+
+
+def kc_delete(service):
+    subprocess.run(["security", "delete-generic-password", "-s", service], capture_output=True)
+
+
+def jwt_claims(token):
+    try:
+        part = token.split(".")[1]
+        return json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+    except (AttributeError, IndexError, ValueError):
+        return {}
+
+
+def running(pattern):
+    if os.environ.get("AI_SWITCH_SKIP_PROCESS_CHECK"):
+        return False
+    return subprocess.run(["pgrep", "-x", pattern], capture_output=True).returncode == 0
+
+
+# ---------- tools ----------
+# Each tool implements:
+#   identity()      -> {"key", "email"} for the current login, or None
+#   export()        -> {"secret", "meta"} for the current login, or None
+#   apply(s, meta)  -> make (secret, meta) the current login
+#   check()         -> raise Fail when the local setup is unsupported
+
+class Tool:
+    name = label = process = ""
+    # desktop apps rewrite their state on exit, so switching under them is lost
+    must_quit = False
+    restart_hint = ""
+
+    def check(self):
+        pass
+
+    def is_running(self):
+        return running(self.process)
+
+
+class Claude(Tool):
+    name, label = "claude", "Claude Code"
+    process = r"claude|claude\.exe"
+    restart_hint = "Start a new 'claude' session to use it."
+    service = "Claude Code-credentials"
+
+    @property
+    def config_file(self):
+        return os.path.join(HOME, ".claude.json")
+
+    @property
+    def creds_file(self):
+        return os.path.join(HOME, ".claude", ".credentials.json")
+
+    def check(self):
+        if os.environ.get("CLAUDE_CONFIG_DIR"):
+            raise Fail("CLAUDE_CONFIG_DIR is set; only the default ~/.claude setup is supported")
+
+    # The credential store also holds MCP server tokens ("mcpOAuth"). Those are
+    # not tied to the Claude account, so only "claudeAiOauth" is swapped.
+    def _blob(self):
+        raw = kc_read(self.service) if BACKEND == "keychain" else None
+        if BACKEND != "keychain" and os.path.exists(self.creds_file):
+            with open(self.creds_file) as f:
+                raw = f.read()
+        return json.loads(raw) if raw and raw.strip() else {}
+
+    def _write_blob(self, blob):
+        if BACKEND == "keychain":
+            kc_write(self.service, json.dumps(blob, separators=(",", ":")))
+        else:
+            write_json(self.creds_file, blob, compact=True)
+
+    @staticmethod
+    def ident_of(account):
+        if not account:
+            return None
+        return {"key": account.get("accountUuid") or account.get("emailAddress") or "",
+                "email": account.get("emailAddress") or "?"}
+
+    def identity(self):
+        return self.ident_of(read_json(self.config_file, {}).get("oauthAccount"))
+
+    def export(self):
+        oauth = self._blob().get("claudeAiOauth")
+        account = read_json(self.config_file, {}).get("oauthAccount")
+        if not oauth or not account:
+            return None
+        return {"secret": oauth, "meta": account}
+
+    def apply(self, secret, meta):
+        blob = self._blob()
+        blob["claudeAiOauth"] = secret
+        self._write_blob(blob)
+        config = read_json(self.config_file, {})
+        config["oauthAccount"] = meta
+        write_json(self.config_file, config)
+
+
+class Codex(Tool):
+    name, label = "codex", "Codex CLI"
+    process = "codex"
+    restart_hint = "Start a new 'codex' session to use it."
+
+    @property
+    def home(self):
+        return os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
+
+    @property
+    def auth_file(self):
+        return os.path.join(self.home, "auth.json")
+
+    def check(self):
+        try:
+            with open(os.path.join(self.home, "config.toml")) as f:
+                m = re.search(r'^\s*cli_auth_credentials_store\s*=\s*"(\w+)"', f.read(), re.M)
+        except FileNotFoundError:
+            return
+        if m and m.group(1) != "file":
+            raise Fail(f'codex stores its login in "{m.group(1)}"; only the default "file" store is supported')
+
+    @staticmethod
+    def ident_of(auth):
+        tokens = auth.get("tokens") or {}
+        if tokens.get("id_token"):
+            claims = jwt_claims(tokens["id_token"])
+            extra = claims.get("https://api.openai.com/auth", {})
+            account_id = tokens.get("account_id") or extra.get("chatgpt_account_id") or ""
+            email = claims.get("email") or "?"
+            plan = extra.get("chatgpt_plan_type")
+            return {"key": f"{claims.get('sub', '')}|{account_id}",
+                    "email": f"{email} ({plan})" if plan else email}
+        if auth.get("OPENAI_API_KEY"):
+            key = auth["OPENAI_API_KEY"]
+            return {"key": "apikey:" + hashlib.sha256(key.encode()).hexdigest()[:16],
+                    "email": f"API key ...{key[-4:]}"}
+        return None
+
+    def identity(self):
+        return self.ident_of(read_json(self.auth_file, {}))
+
+    def export(self):
+        auth = read_json(self.auth_file, {})
+        return {"secret": auth, "meta": None} if self.ident_of(auth) else None
+
+    def apply(self, secret, meta):
+        write_json(self.auth_file, secret)
+
+
+class Cursor(Tool):
+    name, label = "cursor", "Cursor"
+    process = "Cursor|cursor"
+    must_quit = True
+    restart_hint = "Open Cursor to use it."
+    prefix = "cursorAuth/"
+
+    @property
+    def db(self):
+        base = (os.path.join(HOME, "Library", "Application Support") if IS_MAC
+                else os.path.join(HOME, ".config"))
+        return os.path.join(base, "Cursor", "User", "globalStorage", "state.vscdb")
+
+    def _rows(self):
+        if not os.path.exists(self.db):
+            return {}
+        con = sqlite3.connect(self.db, timeout=5)
+        try:
+            rows = con.execute("SELECT key, value FROM ItemTable WHERE key LIKE ?",
+                               (self.prefix + "%",)).fetchall()
+        finally:
+            con.close()
+        return {k: v.decode() if isinstance(v, bytes) else v for k, v in rows}
+
+    @classmethod
+    def ident_of(cls, rows):
+        token = rows.get(cls.prefix + "accessToken")
+        if not token:
+            return None
+        email = rows.get(cls.prefix + "cachedEmail") or "?"
+        return {"key": jwt_claims(token).get("sub") or email, "email": email}
+
+    def identity(self):
+        return self.ident_of(self._rows())
+
+    def export(self):
+        rows = self._rows()
+        return {"secret": rows, "meta": None} if self.ident_of(rows) else None
+
+    def apply(self, secret, meta):
+        if not os.path.exists(self.db):
+            raise Fail("Cursor's settings database was not found; open Cursor once first")
+        con = sqlite3.connect(self.db, timeout=5)
+        try:
+            with con:
+                con.execute("DELETE FROM ItemTable WHERE key LIKE ?", (self.prefix + "%",))
+                con.executemany("INSERT INTO ItemTable (key, value) VALUES (?, ?)", secret.items())
+        finally:
+            con.close()
+
+
+TOOLS = {t.name: t for t in (Claude(), Codex(), Cursor())}
+COMMANDS = {"add", "use", "switch", "next", "list", "ls", "current", "whoami",
+            "remove", "rm", "help", "version"}
+
+
+# ---------- profiles ----------
+
+def profile_dir(tool, name):
+    return os.path.join(STORE, tool.name, name)
+
+
+def secret_service(tool, name):
+    return f"ai-switch:{tool.name}:{name}"
+
+
+def get_secret(tool, name):
+    if BACKEND == "keychain":
+        return kc_read(secret_service(tool, name))
+    path = os.path.join(profile_dir(tool, name), "secret.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return f.read()
+
+
+def set_secret(tool, name, text):
+    if BACKEND == "keychain":
+        kc_write(secret_service(tool, name), text)
+    else:
+        write_file(os.path.join(profile_dir(tool, name), "secret.json"), text)
+
+
+def profiles(tool):
+    base = os.path.join(STORE, tool.name)
+    if not os.path.isdir(base):
+        return []
+    return sorted(n for n in os.listdir(base)
+                  if os.path.isfile(os.path.join(base, n, "account.json")))
+
+
+def account(tool, name):
+    return read_json(os.path.join(profile_dir(tool, name), "account.json"))
+
+
+def save_profile(tool, name, snap, ident):
+    d = profile_dir(tool, name)
+    os.makedirs(d, exist_ok=True)
+    for p in (STORE, os.path.dirname(d), d):
+        os.chmod(p, 0o700)
+    set_secret(tool, name, json.dumps(snap["secret"], separators=(",", ":")))
+    # account.json last: a profile only counts once it exists
+    write_json(os.path.join(d, "account.json"),
+               {"key": ident["key"], "email": ident["email"], "meta": snap["meta"]})
+
+
+def active_profile(tool):
+    ident = tool.identity()
+    if not ident or not ident["key"]:
+        return None
+    for name in profiles(tool):
+        if account(tool, name)["key"] == ident["key"]:
+            return name
+    return None
+
+
+def sync_active(tool):
+    """Tokens rotate while a login is used, so copy the live ones back into
+    its profile before switching away. Otherwise the saved copy goes stale."""
+    name = active_profile(tool)
+    snap = tool.export() if name else None
+    if snap:
+        save_profile(tool, name, snap, tool.identity())
+
+
+def validate_name(name):
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", name) or name in TOOLS or name in COMMANDS:
+        raise Fail(f"invalid profile name '{name}': use letters, digits, '.', '_' or '-', "
+                   "and not a tool or command name")
+
+
+def require_profile(tool, name):
+    validate_name(name)
+    if name not in profiles(tool):
+        raise Fail(f"no {tool.name} profile named '{name}' (see: {PROG} {tool.name} list)")
+
+
+# ---------- commands ----------
+
+def cmd_add(tool, name):
+    validate_name(name)
+    snap = tool.export()
+    if not snap:
+        raise Fail(f"not logged in to {tool.label}. Log in first, then try again.")
+    existing = active_profile(tool)
+    if existing and existing != name:
+        raise Fail(f"this {tool.name} account is already saved as '{existing}'")
+    ident = tool.identity()
+    save_profile(tool, name, snap, ident)
+    info(f"saved current {tool.label} login ({ident['email']}) as '{name}'")
+
+
+def cmd_use(tool, name):
+    require_profile(tool, name)
+    acct = account(tool, name)
+    if active_profile(tool) == name:
+        info(f"{tool.name}: already using '{name}' ({acct['email']})")
+        return
+    if tool.is_running():
+        if tool.must_quit:
+            raise Fail(f"quit {tool.label} first: it overwrites its login when it closes")
+        info(f"warning: {tool.label} is running. Restart open sessions after switching,")
+        info("         otherwise a running session may keep using (and re-save) the old account.")
+    sync_active(tool)
+    secret = get_secret(tool, name)
+    if not secret:
+        raise Fail(f"saved login for {tool.name} '{name}' is missing; add it again")
+    tool.apply(json.loads(secret), acct.get("meta"))
+    info(f"{tool.name}: switched to '{name}' ({acct['email']}). {tool.restart_hint}")
+
+
+def cmd_next(tool):
+    names = profiles(tool)
+    if not names:
+        raise Fail(f"no saved {tool.name} profiles")
+    active = active_profile(tool)
+    i = names.index(active) + 1 if active in names else 0
+    cmd_use(tool, names[i % len(names)])
+
+
+def cmd_list(tool, header=False):
+    names = profiles(tool)
+    if header:
+        print(f"{tool.label}:")
+    if not names:
+        info(f"  no saved profiles yet. Log in, then run: {PROG} {tool.name} add <name>")
+        return
+    active = active_profile(tool)
+    for name in names:
+        marker = "*" if name == active else " "
+        print(f"{marker} {name:<16} {account(tool, name)['email']}")
+
+
+def cmd_current(tool, prefix=""):
+    ident = tool.identity()
+    name = active_profile(tool)
+    if name:
+        print(f"{prefix}{name} ({ident['email']})")
+    elif ident:
+        print(f"{prefix}logged in as {ident['email']} (not saved as a profile)")
+    else:
+        print(f"{prefix}not logged in")
+
+
+def cmd_remove(tool, name):
+    require_profile(tool, name)
+    if BACKEND == "keychain":
+        kc_delete(secret_service(tool, name))
+    shutil.rmtree(profile_dir(tool, name))
+    info(f"removed {tool.name} profile '{name}' (the active login was not changed)")
+
+
+def tool_command(tool, args):
+    tool.check()
+    cmd, rest = (args[0], args[1:]) if args else ("list", [])
+
+    def need():
+        if not rest:
+            raise Fail(f"usage: {PROG} {tool.name} {cmd} <name>")
+        return rest[0]
+
+    if cmd in ("list", "ls"):
+        cmd_list(tool)
+    elif cmd == "add":
+        cmd_add(tool, need())
+    elif cmd in ("use", "switch"):
+        cmd_use(tool, need())
+    elif cmd == "next":
+        cmd_next(tool)
+    elif cmd in ("current", "whoami"):
+        cmd_current(tool)
+    elif cmd in ("remove", "rm"):
+        cmd_remove(tool, need())
+    elif cmd in ("-h", "--help", "help"):
+        print(USAGE)
+    elif cmd in ("-v", "--version", "version"):
+        print(f"{PROG} {VERSION}")
+    else:
+        cmd_use(tool, cmd)
+
+
+def use_everywhere(name):
+    """Switch every tool that has a profile called `name`."""
+    validate_name(name)
+    targets = [t for t in TOOLS.values() if name in profiles(t)]
+    if not targets:
+        raise Fail(f"no profile named '{name}' in any tool (see: {PROG} list)")
+    errors = []
+    for tool in targets:
+        try:
+            tool.check()
+            cmd_use(tool, name)
+        except Fail as e:
+            errors.append(f"{tool.name}: {e}")
+    if errors:
+        raise Fail("; ".join(errors))
+
+
+def list_all():
+    shown = False
+    for tool in TOOLS.values():
+        if profiles(tool) or tool.identity():
+            if shown:
+                print()
+            cmd_list(tool, header=True)
+            shown = True
+    if not shown:
+        info(f"no saved profiles yet. Log in to a tool, then run: {PROG} <tool> add <name>")
+
+
+def current_all():
+    for tool in TOOLS.values():
+        cmd_current(tool, prefix=f"{tool.name + ':':<8}")
+
+
+# ---------- migration from claude-switch 1.x ----------
+
+def migrate_legacy():
+    """claude-switch 1.x kept Claude profiles in ~/.claude-switch and keychain
+    items named claude-switch:<name>. Move them into the ai-switch store."""
+    if not os.path.isdir(LEGACY_STORE):
+        return
+    claude, moved, failed = TOOLS["claude"], 0, False
+    for name in sorted(os.listdir(LEGACY_STORE)):
+        old = os.path.join(LEGACY_STORE, name)
+        meta = read_json(os.path.join(old, "account.json"))
+        if meta is None:
+            continue
+        if name in profiles(claude):
+            moved += 1
+            continue
+        if BACKEND == "keychain":
+            secret = kc_read("claude-switch:" + name)
+        else:
+            path = os.path.join(old, "credentials.json")
+            secret = open(path).read() if os.path.exists(path) else None
+        if not secret:
+            info(f"warning: could not migrate claude-switch profile '{name}' (no saved login)")
+            failed = True
+            continue
+        save_profile(claude, name, {"secret": json.loads(secret), "meta": meta},
+                     Claude.ident_of(meta))
+        if get_secret(claude, name) is None:
+            failed = True
+            continue
+        moved += 1
+    if failed:
+        return
+    if BACKEND == "keychain":
+        for name in os.listdir(LEGACY_STORE):
+            kc_delete("claude-switch:" + name)
+    shutil.rmtree(LEGACY_STORE)
+    if moved:
+        info(f"moved {moved} claude-switch profile(s) into {STORE}")
+
+
+USAGE = f"""ai-switch {VERSION}: swap between saved accounts for AI coding tools
+without signing in again. Tools: {", ".join(TOOLS)}
+
+  ai-switch <tool> add <name>      save the account you are logged in with now
+  ai-switch <tool> <name>          switch that tool to a saved account
+  ai-switch <tool> next            rotate that tool to its next saved account
+  ai-switch <tool> list            show the tool's saved accounts (* = active)
+  ai-switch <tool> current         show the tool's active account
+  ai-switch <tool> remove <name>   forget a saved account
+  ai-switch <name>                 switch every tool that has a profile <name>
+  ai-switch list                   show saved accounts for all tools
+  ai-switch current                show the active account of every tool
+  ai-switch --version              print the version
+
+Setup: log in to account A, run `ai-switch claude add a`. Log in to
+account B with the tool's own login command (not logout), then run
+`ai-switch claude add b`. From then on, `ai-switch claude a` / `... b`.
+`claude-switch` is a shortcut for `ai-switch claude`."""
+
+
+def main(argv):
+    global PROG
+    if os.path.basename(sys.argv[0]) == "claude-switch":
+        PROG = "claude-switch"
+        argv = ["claude"] + argv
+    migrate_legacy()
+    if not argv:
+        return list_all()
+    head, rest = argv[0], argv[1:]
+    if head in TOOLS:
+        return tool_command(TOOLS[head], rest)
+    if head in ("-h", "--help", "help"):
+        print(USAGE)
+    elif head in ("-v", "--version", "version"):
+        print(f"{PROG} {VERSION}")
+    elif head in ("list", "ls"):
+        list_all()
+    elif head in ("current", "whoami"):
+        current_all()
+    elif head in ("use", "switch"):
+        if not rest:
+            raise Fail(f"usage: {PROG} use <name>")
+        use_everywhere(rest[0])
+    elif head in ("add", "next", "remove", "rm"):
+        raise Fail(f"say which tool, for example: {PROG} claude {head} ... (tools: {', '.join(TOOLS)})")
+    else:
+        use_everywhere(head)
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except Fail as e:
+        info(f"{PROG}: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)

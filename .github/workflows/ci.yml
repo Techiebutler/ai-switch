@@ -17,6 +17,8 @@ jobs:
         run: |
           if [ "$RUNNER_OS" = "macOS" ]; then brew install shellcheck; else sudo apt-get install -y shellcheck; fi
       - name: Lint
-        run: shellcheck claude-switch install.sh tests/test.sh
+        run: |
+          shellcheck install.sh tests/test.sh
+          python3 -m py_compile ai-switch
       - name: Test
         run: tests/test.sh

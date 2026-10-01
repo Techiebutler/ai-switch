@@ -1,125 +1,160 @@
-# claude-switch
+# ai-switch
 
-Switch between multiple Claude Code accounts with one command, without logging in again.
+Switch between multiple accounts in your AI coding tools with one command, without signing in again.
+
+Supports **Claude Code**, **Codex CLI** and **Cursor**.
 
 ```console
-$ claude-switch list
-* work       you@company.com
-  personal   you@gmail.com
+$ ai-switch list
+Claude Code:
+* work             you@company.com
+  personal         you@gmail.com
 
-$ claude-switch personal
-switched to 'personal' (you@gmail.com). Start a new 'claude' session to use it.
+Codex CLI:
+* work             you@company.com (team)
+  personal         you@gmail.com (plus)
+
+$ ai-switch personal
+claude: switched to 'personal' (you@gmail.com). Start a new 'claude' session to use it.
+codex: switched to 'personal' (you@gmail.com (plus)). Start a new 'codex' session to use it.
 ```
 
 ## Why
 
-If you use Claude Code with more than one account (work and personal, or several team seats), switching normally means running `/login`, opening the browser, and signing in again every time. Claude Code's login tokens last a long time, so `claude-switch` saves each account's login once and swaps the saved login back in when you switch.
+If you have more than one account (work and personal, or several seats), switching normally means logging out, opening the browser and signing in again, every time you hit a usage limit. Login tokens last a long time, so `ai-switch` saves each account's login once and puts the saved login back when you switch.
 
 ## Install
 
-Requirements: macOS or Linux, `bash`, `python3` (preinstalled on macOS), and Claude Code.
+Requirements: macOS or Linux, and `python3` (preinstalled on macOS).
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Techiebutler/claude-switch/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Techiebutler/ai-switch/main/install.sh | bash
 ```
 
-This installs to `~/.local/bin/claude-switch`. If that folder is not on your `PATH`, the installer tells you what to add to `~/.zshrc` or `~/.bashrc`.
+This installs `ai-switch` to `~/.local/bin`, plus a `claude-switch` shortcut. If that folder is not on your `PATH`, the installer tells you what to add to `~/.zshrc` or `~/.bashrc`.
 
 Or install manually:
 
 ```bash
-git clone https://github.com/Techiebutler/claude-switch.git
-ln -s "$PWD/claude-switch/claude-switch" ~/.local/bin/claude-switch
+git clone https://github.com/Techiebutler/ai-switch.git
+ln -s "$PWD/ai-switch/ai-switch" ~/.local/bin/ai-switch
 ```
 
 ## Setup (once per account)
 
-1. Log in to your first account in Claude Code as usual, then save it:
+1. Log in to your first account in the tool as usual, then save it:
    ```bash
-   claude-switch add work
+   ai-switch claude add work
    ```
-2. Start `claude`, run **`/login`** and sign in with your second account. Exit Claude, then save it:
+2. Log in to your second account using the tool's own login, then save it:
    ```bash
-   claude-switch add personal
+   ai-switch claude add personal
    ```
-3. Repeat step 2 for any other accounts.
+3. Repeat for other accounts and other tools.
 
-> **Use `/login` to change accounts, not `/logout`.** Logging out can revoke the saved login on Anthropic's side, and you would have to add that account again.
+How to log in to another account without losing the saved one:
+
+| Tool | Log in to another account with |
+| --- | --- |
+| Claude Code | `/login` inside `claude` (**not** `/logout`) |
+| Codex CLI | `codex login` |
+| Cursor | Sign in from Cursor's settings. If you have to sign out first, save the current account before doing so. |
+
+> Logging out can revoke the saved login on the provider's side, and you would have to add that account again. Prefer logging in over the top of the current account where the tool allows it.
+
+Use the same profile name (like `work`) across tools and you can switch all of them at once with `ai-switch work`.
 
 ## Usage
 
 | Command | What it does |
 | --- | --- |
-| `claude-switch <name>` | Switch to a saved account (same as `use <name>`) |
-| `claude-switch next` | Switch to the next saved account, handy when you hit a usage limit |
-| `claude-switch list` | Show saved accounts (`*` marks the active one) |
-| `claude-switch current` | Show the active account |
-| `claude-switch add <name>` | Save the account you are logged in with now |
-| `claude-switch remove <name>` | Forget a saved account (does not log you out) |
-| `claude-switch --version` | Print the version |
+| `ai-switch <tool> <name>` | Switch that tool to a saved account |
+| `ai-switch <tool> next` | Switch to the tool's next saved account, handy when you hit a usage limit |
+| `ai-switch <tool> list` | Show the tool's saved accounts (`*` marks the active one) |
+| `ai-switch <tool> current` | Show the tool's active account |
+| `ai-switch <tool> add <name>` | Save the account you are logged in with now |
+| `ai-switch <tool> remove <name>` | Forget a saved account (does not log you out) |
+| `ai-switch <name>` | Switch every tool that has a profile called `<name>` |
+| `ai-switch list` | Show saved accounts for all tools |
+| `ai-switch current` | Show the active account of every tool |
 
-**After switching, quit any running `claude` sessions and start a new one.** A running session keeps the old account in memory. Run `/status` inside Claude to confirm which account is active.
+`<tool>` is `claude`, `codex` or `cursor`. `claude-switch ...` is a shortcut for `ai-switch claude ...`.
+
+**After switching:**
+- **Claude Code, Codex:** quit running sessions and start a new one. A running session keeps the old account in memory.
+- **Cursor:** quit Cursor before switching (`ai-switch` refuses while it is open, because Cursor rewrites its login when it closes), then open it again.
+
+## Supported tools
+
+| Tool | Where it keeps the login | What gets swapped | Status |
+| --- | --- | --- | --- |
+| Claude Code | macOS Keychain `Claude Code-credentials` (Linux: `~/.claude/.credentials.json`) and `oauthAccount` in `~/.claude.json` | Only the `claudeAiOauth` entry and `oauthAccount`. MCP server logins in the same store are left alone. | Tested |
+| Codex CLI | `~/.codex/auth.json` (or `$CODEX_HOME`) | The whole file. ChatGPT logins and API-key logins both work. | Tested |
+| Cursor | `cursorAuth/*` rows in Cursor's `state.vscdb` settings database | Only the `cursorAuth/*` rows | Experimental: tested against the real storage format, not yet in daily use |
+
+Not supported yet:
+- **Windsurf / Devin**: its login storage has not been mapped yet. Contributions welcome.
+- **Codex with `cli_auth_credentials_store = "keyring"`**, and **Claude Code with `CLAUDE_CONFIG_DIR`**: these keep the login elsewhere, so `ai-switch` refuses to run rather than swap the wrong thing.
 
 ## How it works
 
-Claude Code stores your login in two places:
+A profile is a saved copy of a tool's login. On a switch, `ai-switch`:
 
-| What | macOS | Linux |
-| --- | --- | --- |
-| OAuth tokens | Keychain item `Claude Code-credentials` | `~/.claude/.credentials.json` |
-| Account identity | `oauthAccount` in `~/.claude.json` | same |
+1. Saves the current account's latest tokens back to its profile. Tools refresh their tokens while you use them, so this keeps saved profiles from going stale.
+2. Writes the target profile's login into the place the tool reads it.
 
-A profile is a saved copy of both. On a switch, `claude-switch`:
-
-1. Saves the current account's latest tokens back to its profile. Claude Code refreshes tokens while you use it, so this keeps saved profiles from going stale.
-2. Writes the target profile's tokens and identity into the places Claude Code reads.
-
-Only the `claudeAiOauth` entry is swapped. Other entries in the same credential store, such as MCP server logins, are left as they are, so your MCP connections keep working whichever account is active. Settings, history, and projects in `~/.claude` are shared across accounts.
+Settings, history and projects are shared across accounts; only the login changes.
 
 ### Where profiles are stored
 
 | | macOS | Linux |
 | --- | --- | --- |
-| Tokens | Keychain items named `claude-switch:<name>` | `~/.claude-switch/<name>/credentials.json` (mode `600`) |
-| Account info (email, IDs) | `~/.claude-switch/<name>/account.json` | same |
+| Tokens | Keychain items named `ai-switch:<tool>:<name>` | `~/.ai-switch/<tool>/<name>/secret.json` (mode `600`) |
+| Account info (email, IDs) | `~/.ai-switch/<tool>/<name>/account.json` | same |
 
-`~/.claude-switch` is created with mode `700`. Set `CLAUDE_SWITCH_HOME` to use a different folder.
+`~/.ai-switch` is created with mode `700`. Set `AI_SWITCH_HOME` to use a different folder.
+
+### Upgrading from claude-switch 1.x
+
+Run any `ai-switch` or `claude-switch` command and your saved Claude profiles move from `~/.claude-switch` into `~/.ai-switch/claude` automatically. Old commands like `claude-switch work` keep working.
 
 ## Security notes
 
-- Saved tokens give full access to the account, just like the login Claude Code already keeps on your machine. Don't copy `~/.claude-switch` to other machines or commit it anywhere.
+- Saved tokens give full access to the account, just like the logins the tools already keep on your machine. Don't copy `~/.ai-switch` to other machines or commit it anywhere.
 - On macOS, while a token is written to the Keychain it is passed to the `security` command as an argument, so for a moment it is visible to other processes running as your user (for example via `ps`). This is fine on a personal machine. Avoid it on shared multi-user machines.
 - The tool runs only locally and makes no network requests.
 
 ## Troubleshooting
 
-**An account shows as logged out after switching.** Its saved login expired or was revoked (for example after `/logout`, or a long time unused). Run `/login` with that account, then `claude-switch add <same name>` to refresh it.
+**An account shows as logged out after switching.** Its saved login expired or was revoked (for example after logging out, or a long time unused). Log in to that account again, then run `ai-switch <tool> add <same name>` to refresh it.
 
-**"this account is already saved as ..."** Each account can only be saved once. Use `claude-switch remove <old name>` first if you want to rename it.
+**"this account is already saved as ..."** Each account can be saved once per tool. Run `ai-switch <tool> remove <old name>` first if you want to rename it.
 
-**"CLAUDE_CONFIG_DIR is set"** With a custom config directory, Claude Code stores its login under different names, which this tool does not support. Unset it, or use separate `CLAUDE_CONFIG_DIR` folders as your multi-account setup instead (each folder keeps its own login, settings and history).
+**"quit Cursor first"** Cursor overwrites its login when it closes, so quit it completely (Cmd+Q on macOS), switch, then open it again.
 
 ## Uninstall
 
 ```bash
-for n in $(claude-switch list | cut -c3- | awk '{print $1}'); do claude-switch remove "$n"; done
-rm -rf ~/.claude-switch ~/.local/bin/claude-switch
+for t in claude codex cursor; do
+  for n in $(ai-switch "$t" list 2>/dev/null | cut -c3- | awk '{print $1}'); do ai-switch "$t" remove "$n"; done
+done
+rm -rf ~/.ai-switch ~/.local/bin/ai-switch ~/.local/bin/claude-switch
 ```
 
-Your current Claude Code login is not affected.
+Your current logins are not affected.
 
 ## Development
 
 ```bash
-tests/test.sh                                  # end-to-end tests in a temporary HOME with fake tokens
-shellcheck claude-switch install.sh tests/test.sh
+tests/test.sh                     # end-to-end tests in a temporary HOME with fake tokens
+shellcheck install.sh tests/test.sh
 ```
 
-The tests use the file backend (`CLAUDE_SWITCH_BACKEND=file`), so they never touch your real Keychain or login.
+The tests use the file backend (`AI_SWITCH_BACKEND=file`), so they never touch your real Keychain or logins. Adding a tool means one class in `ai-switch` with `identity`, `export` and `apply` methods.
 
 ## Disclaimer
 
-This is an unofficial community tool and is not affiliated with or endorsed by Anthropic. It relies on how Claude Code stores credentials today, which may change in future releases. Using multiple accounts is subject to Anthropic's terms for each account.
+This is an unofficial community tool, not affiliated with or endorsed by Anthropic, OpenAI or Anysphere. It relies on how each tool stores credentials today, which may change in future releases. Using multiple accounts is subject to each provider's terms for each account.
 
 ## License
 
